@@ -121,11 +121,6 @@ public class WithContainerStep extends Step {
 
     public static class Execution extends GeneralNonBlockingStepExecution {
         private static final long serialVersionUID = 1;
-        /**
-         * Invoked on the background thread immediately before {@code docker run}.
-         * Tests use this to prove {@link #start()} returned without blocking the CPS VM.
-         */
-        static volatile Runnable beforeContainerRun;
         private transient final WithContainerStep step;
         private String container;
         private String toolName;
@@ -214,11 +209,6 @@ public class WithContainerStep extends Step {
                 listener.getLogger().println(node.getDisplayName() + " does not seem to be running inside a container");
                 volumes.put(ws, ws);
                 volumes.put(tmp, tmp);
-            }
-
-            Runnable hook = beforeContainerRun;
-            if (hook != null) {
-                hook.run();
             }
 
             String command = launcher.isUnix() ? "cat" : "cmd.exe";

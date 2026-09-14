@@ -46,7 +46,7 @@ import hudson.util.VersionNumber;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 import org.apache.commons.fileupload.FileItem;
 import org.apache.commons.io.FileUtils;
@@ -131,44 +131,49 @@ public class WithContainerStepTest {
     @Test public void containerStartDoesNotBlockCpsVm() {
         story.then(r -> {
             DockerTestUtil.assumeDocker();
-            CountDownLatch inStart = new CountDownLatch(1);
-            CountDownLatch release = new CountDownLatch(1);
-            WithContainerStep.Execution.beforeContainerRun = () -> {
-                inStart.countDown();
-                try {
-                    if (!release.await(2, TimeUnit.MINUTES)) {
-                        throw new IllegalStateException("timed out waiting to resume docker run");
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new RuntimeException(e);
-                }
-            };
-            try {
-                WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "prj");
-                p.setDefinition(new CpsFlowDefinition(
-                    "node {\n" +
-                    "  parallel(\n" +
-                    "    container: {\n" +
-                    "      withDockerContainer('httpd:2.4.59') {\n" +
-                    "        echo 'inside'\n" +
-                    "      }\n" +
-                    "    },\n" +
-                    "    other: {\n" +
-                    "      echo 'other branch ran'\n" +
-                    "    }\n" +
-                    "  )\n" +
-                    "}", true));
-                WorkflowRun b = p.scheduleBuild2(0).waitForStart();
-                assertTrue("docker run must start on a background thread", inStart.await(60, TimeUnit.SECONDS));
-                r.waitForMessage("other branch ran", b);
-                release.countDown();
-                r.assertBuildStatusSuccess(r.waitForCompletion(b));
-                r.assertLogContains("inside", b);
-            } finally {
-                WithContainerStep.Execution.beforeContainerRun = null;
-                release.countDown();
+            // A docker wrapper which stalls on `docker run` and delegates everything else,
+            // so the step really does launch a container once released.
+            File home = tmp.newFolder();
+            File started = new File(home, "started");
+            File release = new File(home, "release");
+            File docker = new File(home, "bin/docker");
+            assertTrue(docker.getParentFile().mkdirs());
+            FileUtils.writeStringToFile(docker,
+                "#!/bin/sh\n" +
+                "if [ \"$1\" = run ]; then\n" +
+                "  : > '" + started + "'\n" +
+                "  while [ ! -f '" + release + "' ]; do sleep 0.2; done\n" +
+                "fi\n" +
+                "exec docker \"$@\"\n", StandardCharsets.UTF_8);
+            assertTrue(docker.setExecutable(true));
+            r.jenkins.getDescriptorByType(DockerTool.DescriptorImpl.class).setInstallations(
+                new DockerTool("blocking", home.getAbsolutePath(), Collections.<ToolProperty<?>>emptyList()));
+
+            WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "prj");
+            p.setDefinition(new CpsFlowDefinition(
+                "node {\n" +
+                "  parallel(\n" +
+                "    container: {\n" +
+                "      withDockerContainer(image: 'httpd:2.4.59', toolName: 'blocking') {\n" +
+                "        echo 'inside'\n" +
+                "      }\n" +
+                "    },\n" +
+                "    other: {\n" +
+                "      echo 'other branch ran'\n" +
+                "    }\n" +
+                "  )\n" +
+                "}", true));
+            WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+            long deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(1);
+            while (!started.exists() && System.nanoTime() < deadline) {
+                Thread.sleep(100);
             }
+            assertTrue("docker run must start on a background thread", started.exists());
+            // The sibling branch must make progress while `docker run` is still stalled.
+            r.waitForMessage("other branch ran", b);
+            assertTrue(release.createNewFile());
+            r.assertBuildStatusSuccess(r.waitForCompletion(b));
+            r.assertLogContains("inside", b);
         });
     }
 
