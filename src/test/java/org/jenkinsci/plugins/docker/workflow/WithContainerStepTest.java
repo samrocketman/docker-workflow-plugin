@@ -46,6 +46,7 @@ import hudson.util.VersionNumber;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.apache.commons.fileupload.FileItem;
 import org.apache.commons.io.FileUtils;
@@ -69,6 +70,7 @@ import org.jenkinsci.plugins.workflow.steps.StepExecution;
 import org.jenkinsci.plugins.workflow.steps.SynchronousNonBlockingStepExecution;
 import org.jenkinsci.plugins.workflow.test.steps.SemaphoreStep;
 import org.junit.Assume;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import org.junit.ClassRule;
 import org.junit.Ignore;
@@ -118,6 +120,54 @@ public class WithContainerStepTest {
                     "}", true));
                 WorkflowRun b = story.j.assertBuildStatusSuccess(p.scheduleBuild2(0));
                 story.j.assertLogContains("Require method GET POST OPTIONS", b);
+            }
+        });
+    }
+
+    /**
+     * {@code docker run} must not occupy the CPS VM. Otherwise a parallel sibling
+     * cannot proceed until the container is up.
+     */
+    @Test public void containerStartDoesNotBlockCpsVm() {
+        story.then(r -> {
+            DockerTestUtil.assumeDocker();
+            CountDownLatch inStart = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            WithContainerStep.Execution.beforeContainerRun = () -> {
+                inStart.countDown();
+                try {
+                    if (!release.await(2, TimeUnit.MINUTES)) {
+                        throw new IllegalStateException("timed out waiting to resume docker run");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+            };
+            try {
+                WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "prj");
+                p.setDefinition(new CpsFlowDefinition(
+                    "node {\n" +
+                    "  parallel(\n" +
+                    "    container: {\n" +
+                    "      withDockerContainer('httpd:2.4.59') {\n" +
+                    "        echo 'inside'\n" +
+                    "      }\n" +
+                    "    },\n" +
+                    "    other: {\n" +
+                    "      echo 'other branch ran'\n" +
+                    "    }\n" +
+                    "  )\n" +
+                    "}", true));
+                WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+                assertTrue("docker run must start on a background thread", inStart.await(60, TimeUnit.SECONDS));
+                r.waitForMessage("other branch ran", b);
+                release.countDown();
+                r.assertBuildStatusSuccess(r.waitForCompletion(b));
+                r.assertLogContains("inside", b);
+            } finally {
+                WithContainerStep.Execution.beforeContainerRun = null;
+                release.countDown();
             }
         });
     }
